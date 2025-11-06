@@ -2,7 +2,7 @@ sitemap_url: "https://www.marian.edu/sitemap.xml"
 domain_allowlist: ["marian.edu"]
 
 # Crawler
-threads: 12          # 10–15 empfohlen
+threads: 12         
 timeout: 10
 delay: 0.5           # Sekunden zwischen Requests pro Thread
 scheduler: "priority"    # "fifo" oder "priority"
