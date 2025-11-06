@@ -1,0 +1,24 @@
+sitemap_url: "https://www.marian.edu/sitemap.xml"
+domain_allowlist: ["marian.edu"]
+
+# Crawler
+threads: 12          # 10–15 empfohlen
+timeout: 10
+delay: 0.5           # Sekunden zwischen Requests pro Thread
+scheduler: "priority"    # "fifo" oder "priority"
+extract_links: true  # pro Seite Links mitzählen
+count_duplicates: true
+
+# Verzeichnisse / Ausgabe
+output_dir: "reports"
+data_dir: "data"
+csv_delimiter: ";"
+
+# Mock ausschalten für echten Crawl
+mock_mode: false
+mock:
+  sitemap_path: "data/mock/sitemap.xml"
+  sample_page_url: "https://www.marian.edu/mock"
+  sample_page_path: "data/mock/page.html"
+
+user_agent: "MarianLinkChecker/0.2"
