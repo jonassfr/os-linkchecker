@@ -71,12 +71,7 @@ Example Output (Mock Mode)
 [report] wrote internal links -> reports/links_sample.csv
 
 
-Notes
-------
-- Use mock mode first to safely test the crawler.
-- Switch to real mode to scan the full Marian sitemap (≈1,500 pages).
-- The program automatically removes duplicates and filters internal links.
-- You can change the output delimiter (csv_delimiter) in config.yaml for your Excel version.
+
 
 
 Author: Jonas Schaefer  
