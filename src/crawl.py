@@ -1,4 +1,4 @@
-# src/crawl.py
+
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter, sleep
 from pathlib import Path
@@ -65,7 +65,7 @@ def _extract_internal_links(page_url: str, html: str, allow_domains: set, *, cou
         abs_url = urljoin(page_url, raw)
         p = urlparse(abs_url)
 
-        # --- MAILTO-Sonderfall --------------------------------------------
+        # MAILTO-Sonderfall 
         if p.scheme == "mailto":
             # p.path ist z.B. "name@marian.edu"
             email = p.path.strip().lower()
@@ -77,7 +77,7 @@ def _extract_internal_links(page_url: str, html: str, allow_domains: set, *, cou
                     # für Unique-Zählung "mailto:<email>" normalisieren
                     uniq_targets.add(f"mailto:{email}")
             continue
-        # -------------------------------------------------------------------
+       
 
         # irrelevante Schemata überspringen
         if p.scheme in SKIP_SCHEMES:
@@ -107,7 +107,7 @@ def _worker(frontier: "queue.Queue[str]", visited: set, vlock: threading.Lock, r
 
     while True:
         try:
-            url = frontier.get_nowait()          # <-- erst URL aus der Queue ziehen
+            url = frontier.get_nowait()         
         except queue.Empty:
             break
 
@@ -213,7 +213,7 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
         threads,
         str(cfg.get("delay", 0)),
         len(ordered),
-        f"{duration:.2f}".replace(".", ","),     # Komma statt Punkt
+        f"{duration:.2f}".replace(".", ","),     
         f"{throughput:.2f}".replace(".", ",")
     ]
 
