@@ -1,4 +1,4 @@
-# src/scheduler.py
+
 from urllib.parse import urlparse
 
 def _path_depth(url: str) -> int:
