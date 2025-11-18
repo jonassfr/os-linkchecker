@@ -1,13 +1,29 @@
 sitemap_url: "https://www.marian.edu/sitemap.xml"
-domain_allowlist: ["marian.edu"]
+domain_allowlist:
+  - "marian.edu"
+  - "marian.cascadecms.com"
+  - "cascadecms.com"
 
 # Crawler
-threads: 12         
+threads: 12
 timeout: 10
-delay: 0.5           # Sekunden zwischen Requests pro Thread
-scheduler: "priority"    # "fifo" oder "priority"
-extract_links: true  # pro Seite Links mitzählen
+delay: 0.5                # Sekunden zwischen Requests pro Thread
+scheduler: "priority"      # "fifo" oder "priority"
+extract_links: true        # pro Seite Links mitzählen
 count_duplicates: true
+
+# Checker-Konfiguration (NEU)
+checker:
+  # Links, die auf das Cascade-Backend/Login zeigen (Platzhalter, ggf. anpassen)
+  cascade_login_patterns:
+    - "https://marian.cascadecms.com"
+    - "/login?u=https://www.marian.edu/cascade"
+  # Nur interne Links (basierend auf domain_allowlist) prüfen?
+  only_internal: true
+  # Redirects gelten als OK, wenn das finale Ziel < 400 ist
+  treat_redirect_as_ok: true
+  # Sicherheitslimit: maximal so viele Links pro Seite wirklich http-checken
+  max_links_per_page: 300
 
 # Verzeichnisse / Ausgabe
 output_dir: "reports"
