@@ -45,7 +45,91 @@ def _is_internal(u: str, allow_domains: set) -> bool:
 
 SKIP_SCHEMES = {"tel", "javascript", "data"}
 
-def _extract_internal_links(page_url: str, html: str, allow_domains: set, *, count_duplicates: bool = True) -> int:
+def is_cascade_login(url: str, patterns: list[str]) -> bool:
+    """
+    Gibt True zurück, wenn die URL einem der Cascade-Login-Pattern entspricht.
+    Andere Logins (Microsoft, Okta, etc.) bleiben unberührt,
+    solange sie nicht in den patterns stehen.
+    """
+    if not patterns:
+        return False
+
+    u = url.lower()
+    for pat in patterns:
+        if not pat:
+            continue
+        if pat.lower() in u:
+            return True
+    return False
+
+def check_link(url: str, session: requests.Session, cfg: dict):
+    """
+    Prüft einen einzelnen Link per HTTP-Request.
+
+    Rückgabe-Tuple:
+        (violation_type, status, final_url, note)
+
+    - violation_type: "ok" oder "broken_link"
+    - status:         HTTP-Statuscode (int) oder "" bei Fehlern ohne Response
+    - final_url:      effektive Ziel-URL (nach Redirects)
+    - note:           kurze Info, z.B. "status>=400", "timeout", "redirect ok"
+    """
+    checker_cfg = cfg.get("checker", {})
+    treat_redirect_as_ok = checker_cfg.get("treat_redirect_as_ok", True)
+
+    timeout = int(cfg.get("timeout", 10))
+    headers = {"User-Agent": cfg.get("user_agent", "MarianLinkChecker/0.2")}
+
+    try:
+        resp = session.get(
+            url,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        final_url = resp.url
+        status = resp.status_code
+
+        # Fall 1: Klar broken (>= 400)
+        if status >= 400:
+            return ("broken_link", status, final_url, "status>=400")
+
+        # Fall 2: Redirect-Handling
+        # Wenn treat_redirect_as_ok=True, sind 3xx okay, solange final < 400
+        if 300 <= status < 400:
+            if treat_redirect_as_ok:
+                return ("ok", status, final_url, "redirect ok")
+            else:
+                return ("broken_link", status, final_url, "redirect treated as broken")
+
+        # Fall 3: Normale 2xx/1xx Antworten → ok
+        note = "ok"
+        if resp.history:
+            note = f"redirect chain len={len(resp.history)}"
+        return ("ok", status, final_url, note)
+
+    except requests.RequestException as e:
+        # Netzfehler, Timeout, DNS etc. → als broken_link reporten
+        msg = f"{type(e).__name__}: {str(e)[:120]}"
+        return ("broken_link", "", "", msg)
+
+
+def _extract_internal_links(
+    page_url: str,
+    html: str,
+    allow_domains: set,
+    *,
+    count_duplicates: bool = True,
+):
+    """
+    Extrahiert alle internen Links aus dem Haupt-Content-Bereich.
+
+    Rückgabe (Dict):
+        {
+            "links": [link1, link2, ...],   # normalisierte URLs (mit Duplikaten)
+            "count": N                      # Anzahl (je nach count_duplicates)
+        }
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     # Header/Nav/Footer/Aside entfernen
@@ -53,12 +137,13 @@ def _extract_internal_links(page_url: str, html: str, allow_domains: set, *, cou
         for node in soup.select(selector):
             node.decompose()
 
-    # Hauptbereich suchen (fallback: gesamtes Dokument)
+    # Hauptbereich suchen (Fallback: gesamtes Dokument)
     main = soup.find("main") or soup.find("div", {"id": "content"}) or soup.find("div", {"class": "content"})
     search_area = main if main else soup
 
     uniq_targets = set()
     occurrences = 0
+    links: list[str] = []
 
     for a in search_area.find_all("a", href=True):
         raw = a["href"].strip()
@@ -67,17 +152,15 @@ def _extract_internal_links(page_url: str, html: str, allow_domains: set, *, cou
 
         # MAILTO-Sonderfall 
         if p.scheme == "mailto":
-            # p.path ist z.B. "name@marian.edu"
-            email = p.path.strip().lower()
-            # Domain extrahieren und gegen Allowlist prüfen
+            email = p.path.strip().lower()  # z.B. "name@marian.edu"
             if "@" in email:
                 _, dom = email.rsplit("@", 1)
                 if any(dom.endswith(ad) for ad in allow_domains):
                     occurrences += 1
-                    # für Unique-Zählung "mailto:<email>" normalisieren
-                    uniq_targets.add(f"mailto:{email}")
+                    norm_mail = f"mailto:{email}"
+                    links.append(norm_mail)
+                    uniq_targets.add(norm_mail)
             continue
-       
 
         # irrelevante Schemata überspringen
         if p.scheme in SKIP_SCHEMES:
@@ -87,17 +170,42 @@ def _extract_internal_links(page_url: str, html: str, allow_domains: set, *, cou
         if not any(p.netloc.endswith(dom) for dom in allow_domains):
             continue
 
-        # Normalisieren für "unique"-Zählung
-        norm = f"{p.scheme}://{p.netloc}{p.path}".rstrip("/")
+        # Pfad muss existieren, sonst uninteressant
         if not p.path:
             continue
 
+        # Normalisieren für "unique"-Zählung
+        norm = f"{p.scheme}://{p.netloc}{p.path}".rstrip("/")
+
         occurrences += 1
+        links.append(norm)
         uniq_targets.add(norm)
 
-    return occurrences if count_duplicates else len(uniq_targets)
+    if count_duplicates:
+        count = occurrences
+    else:
+        count = len(uniq_targets)
 
-def _worker(frontier: "queue.Queue[str]", visited: set, vlock: threading.Lock, results: list, cfg: dict):
+
+    return {
+        "links": links,
+        "count": count,
+    }
+
+
+def _worker(
+    frontier: "queue.Queue[str]",
+    visited: set,
+    vlock: threading.Lock,
+    results: list,
+    cfg: dict,
+    violations: list,
+    violock: threading.Lock,
+    processed: dict,
+    plock: threading.Lock,
+    total: int,
+):
+
     session = requests.Session()  # Session pro Thread (Keep-Alive)
     headers = {"User-Agent": cfg.get("user_agent", "MarianLinkChecker/0.2")}
     timeout = int(cfg.get("timeout", 10))
@@ -105,9 +213,17 @@ def _worker(frontier: "queue.Queue[str]", visited: set, vlock: threading.Lock, r
     extract = bool(cfg.get("extract_links", True))
     allow = set(cfg.get("domain_allowlist", []))
 
+    # Checker-Konfig aus config.yaml
+    checker_cfg = cfg.get("checker", {})
+    patterns = checker_cfg.get("cascade_login_patterns", [])
+    # only_internal brauchst du aktuell nicht, weil _extract_internal_links
+    # sowieso nur interne Links liefert – lassen wir für später drin:
+    only_internal = checker_cfg.get("only_internal", True)
+    max_links = checker_cfg.get("max_links_per_page", 300)
+
     while True:
         try:
-            url = frontier.get_nowait()         
+            url = frontier.get_nowait()
         except queue.Empty:
             break
 
@@ -128,32 +244,120 @@ def _worker(frontier: "queue.Queue[str]", visited: set, vlock: threading.Lock, r
         link_count = ""
         final_url = ""
         ctype = ""
+        report_status = ""
+        links_for_page: list[str] = []
+
+        # NEU: seitenweite Violation-Daten
+        violations_for_page = []  # (page_url, link_url, violation_type, status, final_url, note)
+        violation_summary = "none"
+        violations_count = 0
 
         try:
-            resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)  # <-- Session nutzen
+            resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
             status = str(resp.status_code)
             final_url = resp.url
             ms = (perf_counter() - t0) * 1000.0
+
             # Redirects zu 301 “zusammenfalten”, ohne extra Spalten
-            orig_norm  = _norm_url(url)
+            orig_norm = _norm_url(url)
             final_norm = _norm_url(final_url)
             report_status = 301 if orig_norm != final_norm else resp.status_code
 
             ctype = resp.headers.get("Content-Type", "")
+
+            # Nur HTML-Seiten parsen und Links extrahieren
             if extract and resp.ok and "text/html" in ctype.lower():
-                link_count = str(_extract_internal_links(url, resp.text, allow, count_duplicates=bool(cfg.get("count_duplicates", True))))
+                link_info = _extract_internal_links(
+                    url,
+                    resp.text,
+                    allow,
+                    count_duplicates=bool(cfg.get("count_duplicates", True)),
+                )
+                links_for_page = link_info["links"]
+                link_count = str(link_info["count"])
+
+                # Sicherheitslimit pro Seite anwenden
+                if max_links and len(links_for_page) > max_links:
+                    links_for_page = links_for_page[:max_links]
+
+                # --- NEU: alle Links dieser Seite prüfen ---
+                from urllib.parse import urlparse as _up
+
+                for link_url in links_for_page:
+                    parsed = _up(link_url)
+
+                    # Nur http/https-Links prüfen – keine mailto:, tel:, etc.
+                    if parsed.scheme not in ("http", "https"):
+                        continue
+
+                    # 1) Cascade-Login-Erkennung
+                    if is_cascade_login(link_url, patterns):
+                        violations_for_page.append([
+                            url,          # page_url
+                            link_url,     # link_url
+                            "cascade_login",
+                            "",           # status (nicht relevant)
+                            "",           # final_url
+                            "cascade login link",
+                        ])
+                        continue  # kein zusätzlicher HTTP-Check nötig
+
+                    # 2) HTTP-Status prüfen
+                    v_type, v_status, v_final_url, v_note = check_link(link_url, session, cfg)
+                    if v_type == "broken_link":
+                        violations_for_page.append([
+                            url,
+                            link_url,
+                            "broken_link",
+                            v_status,
+                            v_final_url,
+                            v_note,
+                        ])
+
+                # Seiten-Level-Attribute berechnen
+                if violations_for_page:
+                    types = {v[2] for v in violations_for_page}  # {"broken_link", "cascade_login", ...}
+                    violation_summary = "+".join(sorted(types))
+                    violations_count = len(violations_for_page)
 
         except Exception as e:
             ms = (perf_counter() - t0) * 1000.0
             status = ""
             err = f"{type(e).__name__}: {str(e)[:120]}"
+            if not report_status:
+                report_status = status or ""
 
         ts_end = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+        # NEU: Page-Violations in globale Liste übernehmen
+        if violations_for_page:
+            with violock:
+                violations.extend(violations_for_page)
+
+        # URL-Row für links_multithread.csv
         results.append([
-            url, str(report_status), f"{ms:.2f}", t_name, ts_start, ts_end, err, link_count, final_url, ctype
+            url,
+            str(report_status),
+            f"{ms:.2f}",
+            t_name,
+            ts_start,
+            ts_end,
+            err,
+            link_count,
+            final_url,
+            ctype,
+            violation_summary,
+            str(violations_count),
         ])
+        with plock:
+            processed["n"] += 1
+            n = processed["n"]
+            if n % 100 == 0 or n == total:
+                print(f"[crawl] processed {n}/{total} pages...")
 
         frontier.task_done()
+
+
 
 def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
     if schedule_mode is None:
@@ -163,6 +367,7 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
 
     # Reihenfolge + Limit anwenden
     ordered = order_urls(urls, schedule_mode)[:max_n]
+    total = len(ordered)
 
     # Frontier + visited
     frontier: "queue.Queue[str]" = queue.Queue()
@@ -172,6 +377,12 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
     visited = set()
     vlock = threading.Lock()
     results = []
+    # NEU: globale Violations-Liste + Lock
+    violations: list[list[str]] = []
+    violock = threading.Lock()
+    processed = {"n": 0}
+    plock = threading.Lock()
+
 
     threads = int(cfg.get("threads", 12))
     out_dir = Path(cfg["output_dir"])
@@ -183,26 +394,75 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
     t0 = perf_counter()
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = [ex.submit(_worker, frontier, visited, vlock, results, cfg) for _ in range(threads)]
+        futures = [
+            ex.submit(
+                _worker,
+                frontier,
+                visited,
+                vlock,
+                results,
+                cfg,
+                violations,
+                violock,
+                processed,
+                plock,
+                total,
+            )
+            for _ in range(threads)
+        ]
         for f in futures:
             f.result()  # block until all workers finish
+
 
     duration = perf_counter() - t0
     throughput = (len(results) / duration) if duration > 0 else 0.0
     print(f"[crawl] done: {len(results)} URLs in {duration:.2f}s -> {throughput:.2f} URLs/s")
+
+    # 1) ALLE Violations zählen (broken_link + cascade_login)
+    total_violation_count = len(violations)
+
+    # 2) Seiten mit mindestens einer Violation (egal welcher Typ)
+    pages_with_violations = len({v[0] for v in violations})
+
+    # 3) Gesamtzahl gefundener interner Links (Summe internal_links_found aus results)
+    total_links_found = 0
+    for row in results:
+        val = row[7]  # "internal_links_found"
+        try:
+            links_here = int(val) if val not in ("", None) else 0
+        except ValueError:
+            links_here = 0
+        total_links_found += links_here
+
+
 
     # CSV schreiben
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = writer(f, delimiter=delimiter)
         w.writerow([
             "url","status","time_ms","thread","start_utc","end_utc",
-            "error","internal_links_found","final_url","content_type"
+            "error","internal_links_found","final_url","content_type",
+            "violation","violations_count"
         ])
         w.writerows(results)
 
-    
-
     print(f"[report] {out_csv}")
+
+    # NEU: Detail-Report aller einzelnen Violations
+    viol_csv = out_dir / "violations_links.csv"
+    with open(viol_csv, "w", newline="", encoding="utf-8") as f:
+        w = writer(f, delimiter=delimiter)
+        w.writerow([
+            "page_url",
+            "link_url",
+            "violation_type",
+            "status",
+            "final_url",
+            "note",
+        ])
+        w.writerows(violations)
+
+    print(f"[violations] wrote {len(violations)} rows -> {viol_csv}")
 
     # --- Append run summary for comparisons ---
     summary_csv = out_dir / "run_summary.csv"
@@ -213,16 +473,33 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
         threads,
         str(cfg.get("delay", 0)),
         len(ordered),
-        f"{duration:.2f}".replace(".", ","),     
-        f"{throughput:.2f}".replace(".", ",")
+        f"{duration:.2f}".replace(".", ","),
+        f"{throughput:.2f}".replace(".", ","),
+        total_violation_count,
+        total_links_found,
+        pages_with_violations,
     ]
+
 
     write_header = not summary_csv.exists()
     with open(summary_csv, "a", newline="", encoding="utf-8") as f:
         w = writer(f, delimiter=delimiter)
         if write_header:
-            w.writerow(["ts_utc","scheduler","threads","delay_s","urls_total","duration_s","urls_per_s"])
+            w.writerow([
+                "ts_utc",
+                "scheduler",
+                "threads",
+                "delay_s",
+                "urls_total",
+                "duration_s",
+                "urls_per_s",
+                "broken_links_found",
+                "total_links_found",        # NEU
+                "pages_with_broken_links",  # NEU
+            ])
+
         w.writerow(summary_row)
+
     print(f"[summary] appended -> {summary_csv}")
     # --- end summary ---
 
