@@ -56,8 +56,11 @@ def main():
             all_urls = [line.strip() for line in f if line.strip()]
 
         # Für erste Tests begrenzen
-        max_n = int(cfg.get("max_urls", 1500))
-        url_batch = all_urls[:max_n]
+        max_n = int(cfg.get("max_urls", 0))
+        if max_n > 0:
+            url_batch = all_urls[:max_n]
+        else:
+            url_batch = all_urls
 
         crawl_all(url_batch, cfg)
 
