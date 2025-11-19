@@ -11,6 +11,12 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 
 from src.scheduler import order_urls
+from src.cache import LRUCache  # NEU
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 _thread_local = threading.local()
 
@@ -24,6 +30,23 @@ def _norm_url(u: str) -> str:
     path = (p.path or "/").rstrip("/")
     query = f"?{p.query}" if p.query else ""
     return f"{scheme}://{netloc}{path}{query}"
+
+def _norm_link_target(u: str) -> str:
+    """
+    Normalisiert Ziel-URLs für den Cache-Key.
+
+    Orientierung an _extract_internal_links:
+    - http(s): scheme + netloc + path, ohne trailing Slash, ohne Fragment/Query
+    - alles in Kleinbuchstaben bei scheme/netloc
+    """
+    p = urlparse(u)
+    scheme = (p.scheme or "").lower()
+    netloc = (p.netloc or "").lower()
+    path = (p.path or "/").rstrip("/")
+    # Query und Fragment ignorieren, damit z.B. ?utm=... nicht
+    # tausend verschiedene Keys erzeugt
+    return f"{scheme}://{netloc}{path}"
+
 
 def _rate_limit(delay: float):
     if delay <= 0:
@@ -62,7 +85,12 @@ def is_cascade_login(url: str, patterns: list[str]) -> bool:
             return True
     return False
 
-def check_link(url: str, session: requests.Session, cfg: dict):
+def check_link(
+    url: str,
+    session: requests.Session,
+    cfg: dict,
+    cache=None,
+):
     """
     Prüft einen einzelnen Link per HTTP-Request.
 
@@ -73,6 +101,8 @@ def check_link(url: str, session: requests.Session, cfg: dict):
     - status:         HTTP-Statuscode (int) oder "" bei Fehlern ohne Response
     - final_url:      effektive Ziel-URL (nach Redirects)
     - note:           kurze Info, z.B. "status>=400", "timeout", "redirect ok"
+
+    Wenn ein Cache übergeben wird, werden Ergebnisse pro Ziel-URL gecacht.
     """
     checker_cfg = cfg.get("checker", {})
     treat_redirect_as_ok = checker_cfg.get("treat_redirect_as_ok", True)
@@ -80,6 +110,15 @@ def check_link(url: str, session: requests.Session, cfg: dict):
     timeout = int(cfg.get("timeout", 10))
     headers = {"User-Agent": cfg.get("user_agent", "MarianLinkChecker/0.2")}
 
+    # --- 1) Cache-Lookup vor HTTP-Request ---
+    key = _norm_link_target(url)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            # cached ist bereits das (violation_type, status, final_url, note)-Tuple
+            return cached
+
+    # --- 2) Normaler HTTP-Request + Logik wie vorher ---
     try:
         resp = session.get(
             url,
@@ -92,26 +131,32 @@ def check_link(url: str, session: requests.Session, cfg: dict):
 
         # Fall 1: Klar broken (>= 400)
         if status >= 400:
-            return ("broken_link", status, final_url, "status>=400")
-
-        # Fall 2: Redirect-Handling
-        # Wenn treat_redirect_as_ok=True, sind 3xx okay, solange final < 400
-        if 300 <= status < 400:
-            if treat_redirect_as_ok:
-                return ("ok", status, final_url, "redirect ok")
+            result = ("broken_link", status, final_url, "status>=400")
+        else:
+            # Fall 2: Redirect-Handling
+            if 300 <= status < 400:
+                if treat_redirect_as_ok:
+                    result = ("ok", status, final_url, "redirect ok")
+                else:
+                    result = ("broken_link", status, final_url, "redirect treated as broken")
             else:
-                return ("broken_link", status, final_url, "redirect treated as broken")
-
-        # Fall 3: Normale 2xx/1xx Antworten → ok
-        note = "ok"
-        if resp.history:
-            note = f"redirect chain len={len(resp.history)}"
-        return ("ok", status, final_url, note)
+                # Fall 3: Normale 2xx/1xx Antworten → ok
+                note = "ok"
+                if resp.history:
+                    note = f"redirect chain len={len(resp.history)}"
+                result = ("ok", status, final_url, note)
 
     except requests.RequestException as e:
         # Netzfehler, Timeout, DNS etc. → als broken_link reporten
         msg = f"{type(e).__name__}: {str(e)[:120]}"
-        return ("broken_link", "", "", msg)
+        result = ("broken_link", "", "", msg)
+
+    # --- 3) Ergebnis im Cache speichern (falls aktiv) ---
+    if cache is not None:
+        cache.set(key, result)
+
+    return result
+
 
 
 def _extract_internal_links(
@@ -204,6 +249,7 @@ def _worker(
     processed: dict,
     plock: threading.Lock,
     total: int,
+    cache,
 ):
 
     session = requests.Session()  # Session pro Thread (Keep-Alive)
@@ -303,7 +349,7 @@ def _worker(
                         continue  # kein zusätzlicher HTTP-Check nötig
 
                     # 2) HTTP-Status prüfen
-                    v_type, v_status, v_final_url, v_note = check_link(link_url, session, cfg)
+                    v_type, v_status, v_final_url, v_note = check_link(link_url, session, cfg, cache=cache)
                     if v_type == "broken_link":
                         violations_for_page.append([
                             url,
@@ -383,12 +429,35 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
     processed = {"n": 0}
     plock = threading.Lock()
 
-
     threads = int(cfg.get("threads", 12))
     out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / "links_multithread.csv"
     delimiter = cfg.get("csv_delimiter", ",")
+
+    # --- NEU: Cache nach config anlegen ---
+    cache_cfg = cfg.get("cache", {})
+    cache_mode = cache_cfg.get("mode", "none")
+    cache_max_size = int(cache_cfg.get("max_size", 10000))
+
+    if cache_mode == "lru":
+        cache = LRUCache(max_size=cache_max_size)
+    else:
+        cache = None
+        # --- Performance-Messung (CPU/RAM) vorbereiten ---
+    cpu_percent_avg = None
+    memory_rss_mb = None
+    proc = None
+
+    if psutil is not None:
+        try:
+            proc = psutil.Process()
+            # Erster Call "primt" die Messung; der nächste Call gibt % seit hier
+            proc.cpu_percent(interval=None)
+        except Exception:
+            proc = None
+
+
 
     print(f"[crawl] mode={schedule_mode}, threads={threads}, delay={cfg.get('delay', 0)}s, total={len(ordered)}")
     t0 = perf_counter()
@@ -407,6 +476,7 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
                 processed,
                 plock,
                 total,
+                cache,
             )
             for _ in range(threads)
         ]
@@ -418,8 +488,20 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
     throughput = (len(results) / duration) if duration > 0 else 0.0
     print(f"[crawl] done: {len(results)} URLs in {duration:.2f}s -> {throughput:.2f} URLs/s")
 
-    # 1) ALLE Violations zählen (broken_link + cascade_login)
-    total_violation_count = len(violations)
+    # CPU/RAM nach dem Crawl messen (falls psutil verfügbar)
+    if proc is not None:
+        try:
+            cpu_percent_avg = proc.cpu_percent(interval=None)  # % CPU seit dem letzten Aufruf
+            mem_bytes = proc.memory_info().rss
+            memory_rss_mb = mem_bytes / (1024 * 1024)
+        except Exception:
+            cpu_percent_avg = None
+            memory_rss_mb = None
+
+
+    # 1) Violations nach Typ zählen
+    broken_links_total = sum(1 for v in violations if v[2] == "broken_link")
+    cascade_logins_total = sum(1 for v in violations if v[2] == "cascade_login")
 
     # 2) Seiten mit mindestens einer Violation (egal welcher Typ)
     pages_with_violations = len({v[0] for v in violations})
@@ -433,6 +515,25 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
         except ValueError:
             links_here = 0
         total_links_found += links_here
+
+    # 4) Cache-Statistiken
+    cache_cfg = cfg.get("cache", {})
+    cache_mode = cache_cfg.get("mode", "none")
+    cache_max_size = int(cache_cfg.get("max_size", 10000))
+
+    # Standardwerte, falls kein Cache verwendet wird
+    cache_accesses = 0
+    cache_hits = 0
+    cache_misses = 0
+    cache_hit_ratio = 0.0
+
+    # Wenn ein echter Cache existiert, Stats auslesen
+    if cache is not None:
+        stats = cache.stats
+        cache_accesses = int(stats.get("accesses", 0))
+        cache_hits = int(stats.get("hits", 0))
+        cache_misses = int(stats.get("misses", 0))
+        cache_hit_ratio = float(stats.get("hit_ratio", 0.0))
 
 
 
@@ -467,18 +568,35 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
     # --- Append run summary for comparisons ---
     summary_csv = out_dir / "run_summary.csv"
     from datetime import datetime as _dt
+    # Hilfsfunktionen für optionale CPU/RAM-Werte
+    def _fmt_opt_float(x):
+        if isinstance(x, (int, float)):
+            return f"{x:.2f}".replace(".", ",")
+        return ""
+
     summary_row = [
-        _dt.utcnow().isoformat(timespec="seconds") + "Z",
-        schedule_mode,
-        threads,
-        str(cfg.get("delay", 0)),
-        len(ordered),
-        f"{duration:.2f}".replace(".", ","),
-        f"{throughput:.2f}".replace(".", ","),
-        total_violation_count,
-        total_links_found,
-        pages_with_violations,
+        _dt.utcnow().isoformat(timespec="seconds") + "Z",  # ts_utc
+        schedule_mode,                                     # scheduler
+        threads,                                           # threads
+        str(cfg.get("delay", 0)),                          # delay_s
+        len(ordered),                                      # urls_total
+        f"{duration:.2f}".replace(".", ","),               # duration_s
+        f"{throughput:.2f}".replace(".", ","),             # urls_per_s
+        broken_links_total,                                # broken_links_total
+        cascade_logins_total,                              # cascade_logins_total
+        pages_with_violations,                             # pages_with_violations
+        total_links_found,                                 # total_links_found (extra, nützlich)
+        cache_mode,                                        # cache_mode
+        cache_max_size,                                    # cache_max_size
+        cache_accesses,                                    # cache_accesses
+        cache_hits,                                        # cache_hits
+        cache_misses,                                      # cache_misses
+        f"{cache_hit_ratio:.4f}".replace(".", ","),        # cache_hit_ratio
+        _fmt_opt_float(cpu_percent_avg),                   # cpu_percent_avg
+        _fmt_opt_float(memory_rss_mb),                     # memory_rss_mb
     ]
+
+
 
 
     write_header = not summary_csv.exists()
@@ -493,14 +611,28 @@ def crawl_all(urls: list[str], cfg: dict, schedule_mode: str = None) -> float:
                 "urls_total",
                 "duration_s",
                 "urls_per_s",
-                "broken_links_found",
-                "total_links_found",        # NEU
-                "pages_with_broken_links",  # NEU
+                "broken_links_total",
+                "cascade_logins_total",
+                "pages_with_violations",
+                "total_links_found",
+                "cache_mode",
+                "cache_max_size",
+                "cache_accesses",
+                "cache_hits",
+                "cache_misses",
+                "cache_hit_ratio",
+                "cpu_percent_avg",
+                "memory_rss_mb",
             ])
+
 
         w.writerow(summary_row)
 
+
     print(f"[summary] appended -> {summary_csv}")
     # --- end summary ---
+
+
+
 
     return throughput
