@@ -12,6 +12,11 @@ scheduler: "priority"      # "fifo" oder "priority"
 extract_links: true        # pro Seite Links mitzählen
 count_duplicates: true
 
+# Cache-Konfiguration (NEU)
+cache:
+  mode: "lru"      # "none" | "lru"
+  max_size: 10000   # maximale Anzahl gecachter Einträge (Link-Ziele)
+
 # Checker-Konfiguration (NEU)
 checker:
   # Links, die auf das Cascade-Backend/Login zeigen (Platzhalter, ggf. anpassen)
